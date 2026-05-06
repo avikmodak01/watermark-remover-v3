@@ -25,7 +25,7 @@ import os
 from werkzeug.utils import secure_filename
 
 app = Flask(__name__)
-app.secret_key = "change-me-in-production"  # for flash() messages
+app.secret_key = os.environ.get("FLASK_SECRET_KEY", "dev-only-key")
 
 # Limit uploads to 50 MB - RBI circulars are usually 1-10 MB
 app.config['MAX_CONTENT_LENGTH'] = 50 * 1024 * 1024

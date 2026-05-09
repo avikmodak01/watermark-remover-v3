@@ -1,169 +1,232 @@
 """
-RBI Watermark Remover - Flask Web App
-======================================
+RBI Watermark Remover - Flask Web App  (v2 - auto-detect)
+=========================================================
 
-Removes per-user tracking watermarks from RBI scanned PDFs that follow
-the structure produced by the EKP/DMS download system:
+Removes per-user tracking watermarks from RBI PDFs that are issued
+through EKP / DMS. Handles two structures we have seen so far:
 
-    Page Layer 1 (bottom): Clean scan of the document (Canon SC1011 JPEG)
-    Page Layer 2 (top):    Watermark image "Im2" with a soft mask containing
-                           the user ID and download timestamp text
+    Variant A:  Scanned PDFs (Canon SC1011)
+                Watermark = a separate image overlay (e.g. /Im2)
+                with a soft-mask containing the text.
 
-This script removes Layer 2 from every page, leaving Layer 1 untouched.
+    Variant B:  Word-generated PDFs (Microsoft Word)
+                Watermark = a full-page-sized image (e.g. /Im1, /Im4)
+                drawn at the bottom of every page's content stream.
+
+Instead of hardcoding the image name, this version *detects* the
+watermark by looking for any image drawn at the page's full size.
+Real document content almost never covers the entire page exactly,
+so a full-page image draw is a reliable watermark signature.
 
 VBA analogy:
-    Each PDF page is like an Excel worksheet with two stacked Pictures.
-    We loop through every "sheet", find the Picture named "Im2",
-    and delete it. The original scan picture stays untouched.
+    Each PDF page is like a worksheet with several Pictures on it.
+    We scan every page, find any Picture whose width and height
+    match the page exactly, and remove it. The other Pictures
+    (logos, signatures, real photos) are smaller, so they stay.
 """
 
-from flask import Flask, request, render_template, send_file, flash, redirect, url_for
+from flask import Flask, request, send_file, flash, redirect, url_for, render_template_string
 import pikepdf
 import re
 import io
 import os
+from collections import defaultdict
 from werkzeug.utils import secure_filename
 
 app = Flask(__name__)
 app.secret_key = os.environ.get("FLASK_SECRET_KEY", "dev-only-key")
+app.config["MAX_CONTENT_LENGTH"] = 50 * 1024 * 1024  # 50 MB
 
-# Limit uploads to 50 MB - RBI circulars are usually 1-10 MB
-app.config['MAX_CONTENT_LENGTH'] = 50 * 1024 * 1024
+# Tolerance (in PDF points) for matching "full-page" image dimensions.
+# 5 points = ~1.7 mm, more than enough to absorb rounding errors.
+SIZE_TOLERANCE = 5.0
 
-# The name of the watermark image in the PDF resources.
-# This is what we identified by inspecting the PDF structure.
-WATERMARK_IMAGE_NAME = "/Im2"
+# Regex: matches a "draw image at <w> x <h> position 0,0" instruction.
+# In PDF content streams an image is drawn by:
+#     <width> 0 0 <height> <x> <y> cm  /<name> Do
+# We only care about ones drawn at origin (0,0) at full page size.
+FULLPAGE_DRAW = re.compile(
+    r'([\d.]+)\s+0\s+0\s+([\d.]+)\s+0\s+0\s+cm\s*/(\w+)\s+Do'
+)
+
+
+def get_page_size(page) -> tuple[float, float]:
+    """Return (width, height) of a page in PDF points."""
+    box = page.MediaBox
+    return float(box[2]) - float(box[0]), float(box[3]) - float(box[1])
+
+
+def find_watermark_images(pdf: pikepdf.Pdf) -> set[str]:
+    """
+    Scan every page. Return the set of image names that are drawn
+    at full page size on at least one page. Those are the watermarks.
+
+    VBA analogy: loop through every Sheet's Shapes, note the names of
+    Pictures whose Width = Sheet width and Height = Sheet height.
+    Those are the watermarks.
+    """
+    appearances: dict[str, int] = defaultdict(int)
+
+    for page in pdf.pages:
+        try:
+            page_w, page_h = get_page_size(page)
+        except Exception:
+            continue
+
+        # A page's content can be one stream or an array of streams.
+        contents = page.get("/Contents")
+        if contents is None:
+            continue
+        streams = list(contents) if isinstance(contents, pikepdf.Array) else [contents]
+
+        seen_on_this_page: set[str] = set()
+        for stream in streams:
+            try:
+                data = stream.read_bytes().decode("latin-1", errors="ignore")
+            except Exception:
+                continue
+            for w_str, h_str, name in FULLPAGE_DRAW.findall(data):
+                w, h = float(w_str), float(h_str)
+                if (abs(w - page_w) < SIZE_TOLERANCE
+                        and abs(h - page_h) < SIZE_TOLERANCE):
+                    seen_on_this_page.add(name)
+
+        for name in seen_on_this_page:
+            appearances[name] += 1
+
+    # Any image drawn full-page on at least one page is a watermark.
+    # Different PDFs use different watermark images on cover vs. body
+    # pages, so we don't require a high page-count threshold.
+    return set(appearances.keys())
 
 
 def remove_watermark(pdf_bytes: bytes) -> tuple[bytes, dict]:
     """
-    Take raw PDF bytes, remove the watermark, return cleaned PDF bytes
-    plus a small report dict (how many pages, whether watermark was found).
-
-    VBA analogy: think of this as a Function that takes a Workbook,
-    deletes a specific Picture from every Sheet, and returns the modified
-    Workbook plus a status message.
+    Open the PDF, find watermark images, strip them from every page they
+    appear on, and return the cleaned bytes plus a report.
     """
-    # Open the PDF from memory (not from disk - safer for a web app)
     pdf = pikepdf.open(io.BytesIO(pdf_bytes))
-
-    pages_cleaned = 0
     total_pages = len(pdf.pages)
 
+    # Step 1: detect which image names are watermarks.
+    watermark_names = find_watermark_images(pdf)
+
+    if not watermark_names:
+        return pdf_bytes, {
+            "total_pages": total_pages,
+            "pages_cleaned": 0,
+            "watermark_names": [],
+            "success": False,
+        }
+
+    # Step 2: remove the draw operations and resource references.
+    pages_cleaned = 0
+
     for page in pdf.pages:
-        watermark_found = False
+        page_changed = False
 
-        # Step 1: Remove the watermark image from the page's resource list.
-        # In VBA terms: delete the Shape from the worksheet's Shapes collection.
-        try:
-            resources = page.get("/Resources", {})
-            if "/XObject" in resources:
-                xobjects = resources["/XObject"]
-                if WATERMARK_IMAGE_NAME in xobjects:
-                    del xobjects[WATERMARK_IMAGE_NAME]
-                    watermark_found = True
-        except Exception:
-            # If a page has unusual structure, skip it rather than crash.
-            pass
-
-        # Step 2: Remove the drawing instruction from the page's content stream.
-        # The content stream is a script the PDF reader runs to draw the page.
-        # The watermark is drawn by a block like:  q ... /Im2 Do ... Q
-        # (q = save state, /Im2 Do = draw the image, Q = restore state)
-        try:
-            contents = page["/Contents"]
-            # Some PDFs store contents as a single stream, others as an array.
-            # Handle both.
-            if isinstance(contents, pikepdf.Array):
-                streams = list(contents)
-            else:
-                streams = [contents]
-
+        # Remove the draw operations from the content stream(s).
+        contents = page.get("/Contents")
+        if contents is not None:
+            streams = list(contents) if isinstance(contents, pikepdf.Array) else [contents]
             for stream in streams:
-                data = stream.read_bytes().decode('latin-1', errors='ignore')
-                # Regex meaning: find "q" then anything (non-greedy) then
-                # "/Im2 Do" then anything then "Q" - and remove that whole block.
-                cleaned = re.sub(
-                    r'q\s+[^q]*?' + re.escape(WATERMARK_IMAGE_NAME) + r'\s+Do\s+Q',
-                    '',
-                    data,
-                    flags=re.DOTALL
-                )
-                if cleaned != data:
-                    stream.write(cleaned.encode('latin-1'))
-                    watermark_found = True
-        except Exception:
-            pass
+                try:
+                    data = stream.read_bytes().decode("latin-1", errors="ignore")
+                except Exception:
+                    continue
 
-        if watermark_found:
+                original = data
+                for name in watermark_names:
+                    name_re = re.escape(name)
+                    # Two patterns: with the optional /Artifact BMC...EMC wrapper
+                    # that Word emits, and without (older Canon scans).
+                    patterns = [
+                        # Wrapped form: /Artifact BMC q ... /Name Do Q EMC
+                        rf'/Artifact\s*BMC\s*q\s+[\d.]+\s+0\s+0\s+[\d.]+\s+0\s+0\s+cm\s*/{name_re}\s+Do\s*Q\s*EMC',
+                        # Plain form: q ... /Name Do Q
+                        rf'q\s+[^q]*?/{name_re}\s+Do\s*Q',
+                    ]
+                    for pat in patterns:
+                        data = re.sub(pat, '', data, flags=re.DOTALL)
+
+                if data != original:
+                    stream.write(data.encode("latin-1"))
+                    page_changed = True
+
+        # Remove the watermark images from the resource dictionary too.
+        resources = page.get("/Resources")
+        if resources is not None and "/XObject" in resources:
+            xobjects = resources["/XObject"]
+            for name in watermark_names:
+                key = f"/{name}"
+                if key in xobjects:
+                    del xobjects[key]
+                    page_changed = True
+
+        if page_changed:
             pages_cleaned += 1
 
-    # Save the modified PDF to memory (not disk).
     output = io.BytesIO()
     pdf.save(output)
     output.seek(0)
 
-    report = {
+    return output.read(), {
         "total_pages": total_pages,
         "pages_cleaned": pages_cleaned,
+        "watermark_names": sorted(watermark_names),
         "success": pages_cleaned > 0,
     }
-    return output.read(), report
 
 
 # =====================================================================
-# Flask routes - the URLs that the browser will hit
+# Web UI
 # =====================================================================
 
-# HTML template kept inline so this is a single-file app.
-# (Like keeping a UserForm and its code in the same VBA module.)
 HOME_PAGE = """
 <!DOCTYPE html>
 <html>
 <head>
-    <title>RBI Watermark Remover</title>
-    <style>
-        body { font-family: -apple-system, Arial, sans-serif; max-width: 640px;
-               margin: 40px auto; padding: 0 20px; color: #222; }
-        h1 { color: #003366; border-bottom: 2px solid #003366; padding-bottom: 8px; }
-        .upload-box { border: 2px dashed #003366; border-radius: 8px;
-                      padding: 30px; text-align: center; background: #f4f7fb; }
-        input[type=file] { margin: 12px 0; }
-        button { background: #003366; color: white; border: 0; padding: 10px 24px;
-                 border-radius: 4px; font-size: 15px; cursor: pointer; }
-        button:hover { background: #00509e; }
-        .flash { background: #fff3cd; border: 1px solid #ffc107; padding: 10px;
-                 border-radius: 4px; margin: 12px 0; }
-        .note { font-size: 13px; color: #666; margin-top: 24px;
-                background: #fafafa; padding: 12px; border-left: 3px solid #999; }
-    </style>
+  <title>RBI Watermark Remover</title>
+  <style>
+    body { font-family: -apple-system, Arial, sans-serif; max-width: 640px;
+           margin: 40px auto; padding: 0 20px; color: #222; }
+    h1 { color: #003366; border-bottom: 2px solid #003366; padding-bottom: 8px; }
+    .upload-box { border: 2px dashed #003366; border-radius: 8px;
+                  padding: 30px; text-align: center; background: #f4f7fb; }
+    button { background: #003366; color: white; border: 0; padding: 10px 24px;
+             border-radius: 4px; font-size: 15px; cursor: pointer; }
+    button:hover { background: #00509e; }
+    .flash { background: #fff3cd; border: 1px solid #ffc107; padding: 10px;
+             border-radius: 4px; margin: 12px 0; }
+    .note { font-size: 13px; color: #666; margin-top: 24px;
+            background: #fafafa; padding: 12px; border-left: 3px solid #999; }
+  </style>
 </head>
 <body>
-    <h1>RBI Watermark Remover</h1>
-    <p>Upload an RBI PDF that has the diagonal user-ID + timestamp watermark.
-       The tool removes the watermark layer and returns the cleaned scan.</p>
+  <h1>RBI Watermark Remover</h1>
+  <p>Upload an RBI PDF that has the diagonal user-ID watermark.
+     The tool detects the watermark layer automatically and removes it,
+     whether the PDF is a Canon scan or a Word-generated document.</p>
 
-    {% with messages = get_flashed_messages() %}
-      {% if messages %}
-        {% for msg in messages %}<div class="flash">{{ msg }}</div>{% endfor %}
-      {% endif %}
-    {% endwith %}
+  {% with messages = get_flashed_messages() %}
+    {% if messages %}
+      {% for msg in messages %}<div class="flash">{{ msg }}</div>{% endfor %}
+    {% endif %}
+  {% endwith %}
 
-    <div class="upload-box">
-        <form method="POST" action="/clean" enctype="multipart/form-data">
-            <input type="file" name="pdf" accept=".pdf" required>
-            <br>
-            <button type="submit">Remove Watermark</button>
-        </form>
-    </div>
+  <div class="upload-box">
+    <form method="POST" action="/clean" enctype="multipart/form-data">
+      <input type="file" name="pdf" accept=".pdf" required><br>
+      <button type="submit">Remove Watermark</button>
+    </form>
+  </div>
 
-    <div class="note">
-        <b>Note:</b> The watermark contains a user ID that traces the document
-        to a specific person. Use this only on PDFs you have a legitimate
-        reason to clean (e.g. your own downloads where the watermark is
-        obstructing readability). Do not redistribute cleaned copies of
-        documents downloaded under another person's ID.
-    </div>
+  <div class="note">
+    <b>Note:</b> The watermark contains a user ID that traces the document
+    to a specific person. Use this only on PDFs you have a legitimate
+    reason to clean, and do not redistribute cleaned copies of documents
+    that were downloaded under another person's ID.
+  </div>
 </body>
 </html>
 """
@@ -171,28 +234,20 @@ HOME_PAGE = """
 
 @app.route("/", methods=["GET"])
 def home():
-    """Show the upload form."""
-    return render_template_string_inline(HOME_PAGE)
+    return render_template_string(HOME_PAGE)
 
 
 @app.route("/clean", methods=["POST"])
 def clean():
-    """Receive the uploaded PDF, clean it, send back the result."""
-    # Step 1: Validate the upload.
-    if "pdf" not in request.files:
-        flash("No file uploaded.")
+    if "pdf" not in request.files or request.files["pdf"].filename == "":
+        flash("Please choose a PDF file.")
         return redirect(url_for("home"))
 
     file = request.files["pdf"]
-    if file.filename == "":
-        flash("No file selected.")
-        return redirect(url_for("home"))
-
     if not file.filename.lower().endswith(".pdf"):
         flash("Only PDF files are accepted.")
         return redirect(url_for("home"))
 
-    # Step 2: Read the file into memory and run the cleaner.
     try:
         pdf_bytes = file.read()
         cleaned_bytes, report = remove_watermark(pdf_bytes)
@@ -203,35 +258,21 @@ def clean():
         flash(f"Could not process the PDF. Error: {e}")
         return redirect(url_for("home"))
 
-    # Step 3: If we did not find a watermark, warn the user.
     if not report["success"]:
         flash(
-            f"No '{WATERMARK_IMAGE_NAME}' watermark layer was found in this PDF. "
-            f"The file may use a different watermark format. The download below "
-            f"is the original PDF unchanged."
+            "No watermark layer was detected in this PDF. The download below "
+            "is the original file unchanged. If you believe a watermark is "
+            "present, send the file to the maintainer for analysis."
         )
 
-    # Step 4: Build a sensible output filename.
-    original_name = secure_filename(file.filename)
-    base = os.path.splitext(original_name)[0]
-    output_name = f"{base}_clean.pdf"
-
-    # Step 5: Send the cleaned PDF back to the browser as a download.
+    base = os.path.splitext(secure_filename(file.filename))[0]
     return send_file(
         io.BytesIO(cleaned_bytes),
         mimetype="application/pdf",
         as_attachment=True,
-        download_name=output_name,
+        download_name=f"{base}_clean.pdf",
     )
 
 
-def render_template_string_inline(template):
-    """Tiny wrapper so we don't need a templates/ folder for one page."""
-    from flask import render_template_string
-    return render_template_string(template)
-
-
 if __name__ == "__main__":
-    # debug=True gives you the auto-reload + error page while developing.
-    # Turn it off in production.
     app.run(host="0.0.0.0", port=5000, debug=True)
